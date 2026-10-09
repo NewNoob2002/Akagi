@@ -25,8 +25,12 @@ pub trait CaptureBackend: Send {
 }
 ```
 
-`CaptureCtx` carries the buses and session. `ShutdownToken` is a
-cooperative cancellation handle wired to the supervisor.
+`CaptureCtx` carries the buses and session. `ShutdownToken` retains a
+cooperative cancellation request through a watch channel: current and late
+waiters both observe it. Chromium's startup endpoint wait is cancellable.
+The supervisor serialises start/stop/restart, waits for actual backend cleanup,
+and retains a still-stopping run after a 20-second shutdown timeout so a new
+backend cannot overlap it.
 
 ## Adding a new backend
 

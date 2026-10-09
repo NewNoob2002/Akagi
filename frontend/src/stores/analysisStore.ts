@@ -10,5 +10,7 @@ type AnalysisStore = {
 export const useAnalysisStore = create<AnalysisStore>((set) => ({
   result: null,
   updatedAt: null,
-  set: (r) => set({ result: r, updatedAt: r ? Date.now() : null }),
+  set: (r) => set((current) => r && current.result && r.revision < current.result.revision
+    ? current
+    : { result: r, updatedAt: r ? Date.now() : null }),
 }))

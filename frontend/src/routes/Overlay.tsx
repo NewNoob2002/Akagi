@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { X } from 'lucide-react'
 import { BotShowList } from '@/components/BotShowList'
 import { pickShow, visibleItems } from '@/lib/botShow'
-import { invoke, listen } from '@/lib/tauri'
+import { createEventScope, invoke } from '@/lib/tauri'
 import type { AppConfig, BotResponse, OverlayConfig, ShowMeta } from '@/types'
 
 // The always-on-top overlay window's entire UI. Mounted by main.tsx instead of
@@ -31,31 +31,35 @@ export function Overlay() {
   const [cfg, setCfg] = useState<OverlayConfig>(FALLBACK)
 
   useEffect(() => {
-    const unlistens: Array<() => void> = []
+    const scope = createEventScope()
     let cancelled = false
+    let liveConfig = false
 
     // The window is opened by the backend, so config is already on disk;
     // `overlay-config` keeps us in step with later edits in Settings.
     invoke<AppConfig>('get_config')
       .then((c) => {
-        if (!cancelled) setCfg(c.overlay)
+        if (!cancelled && !liveConfig) setCfg(c.overlay)
       })
       .catch(() => {
         /* keep the fallback — a blank overlay would be worse than a default one */
       })
 
-    listen<BotResponse>('bot-response', (r) => {
+    void scope.listen<BotResponse>('bot-response', (r) => {
       const s = pickShow(r.meta)
       // Responses without a `show` block (e.g. a bare `none`) must not wipe
       // the last real suggestion off the screen.
       if (s) setShow(s)
-    }).then((u) => unlistens.push(u))
+    }).catch((error) => console.error('Overlay event registration failed', error))
 
-    listen<OverlayConfig>('overlay-config', (c) => setCfg(c)).then((u) => unlistens.push(u))
+    void scope.listen<OverlayConfig>('overlay-config', (c) => {
+      liveConfig = true
+      setCfg(c)
+    }).catch((error) => console.error('Overlay config registration failed', error))
 
     return () => {
       cancelled = true
-      unlistens.forEach((u) => u())
+      scope.dispose()
     }
   }, [])
 

@@ -21,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+from data_split import split_game_ranges
+
 # Architecture constants — MUST match native_bot::model on the Rust side.
 CONV = 64
 BLOCKS = 3
@@ -141,22 +143,26 @@ def main():
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--val-frac", type=float, default=0.02, help="fraction of whole games held out")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     torch.manual_seed(0)
     np.random.seed(0)
 
+    # Split before shuffling actions; correlated positions from one game must
+    # never appear in both partitions. Validate metadata before loading arrays.
+    with open(os.path.join(args.data, "meta.json")) as f:
+        train_ranges, val_ranges = split_game_ranges(json.load(f), args.val_frac)
+    train_idx = np.concatenate([np.arange(start, end) for start, end in train_ranges])
+    val_idx = np.concatenate([np.arange(start, end) for start, end in val_ranges])
+    print(f"split: {len(train_ranges)} train games / {len(val_ranges)} validation games; "
+          f"{len(train_idx)} train samples / {len(val_idx)} validation samples")
     meta, obs, act, msk = load_dataset(args.data)
     C, T, A = meta["channels"], meta["tile_dim"], meta["action_space"]
     obs_scale = meta["obs_scale"]
     n = meta["total_samples"]
     print(f"loaded {n} samples  C={C} T={T} A={A}  device={args.device}")
-
-    perm = np.random.permutation(n)
-    n_val = int(n * args.val_frac)
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
 
     dev = torch.device(args.device)
     model = Net(C, T, A).to(dev)

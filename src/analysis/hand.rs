@@ -93,6 +93,8 @@ pub struct OpponentInfo {
     pub discards: Vec<Tile34>,
     pub tedashi: Vec<bool>,
     pub melds: Vec<Meld34>,
+    /// Number of this player's discards when their last open call occurred.
+    pub last_open_meld_discard_count: usize,
     pub is_riichi: bool,
     pub riichi_turn: Option<u8>,
     pub can_ippatsu: bool,
@@ -121,6 +123,8 @@ pub struct PlayerInfo34 {
     pub melds: Vec<Meld34>,
     /// Number of red-fives we hold (in hand + melds).
     pub aka_count: u8,
+    /// Red copies in the concealed hand, indexed by suit (man/pin/sou).
+    pub aka_hand: [u8; 3],
     /// Dora-indicator tiles (the discards on the wall, not the active doras).
     pub dora_indicators: Vec<Tile34>,
     /// Round wind tile (`E`/`S`/`W`/`N`).
@@ -169,31 +173,27 @@ impl PlayerInfo34 {
         for (l, h) in left.iter_mut().zip(self.hand.iter()) {
             *l = l.saturating_sub(*h);
         }
-        // Own melds
-        for m in &self.melds {
-            let mut tmp = [0u8; TILE_COUNT];
-            m.add_to_counts(&mut tmp);
-            for (l, t) in left.iter_mut().zip(tmp.iter()) {
-                *l = l.saturating_sub(*t);
-            }
+        // Rivers retain claimed discards. Count all rivers, then exclude the
+        // claimed tile from every open meld, including our own.
+        for d in self
+            .own_discards
+            .iter()
+            .chain(self.opponents.iter().flat_map(|op| &op.discards))
+        {
+            left[d.idx() as usize] = left[d.idx() as usize].saturating_sub(1);
         }
-        // Opponents — discards, melds, called-from-others (avoid double counting).
-        for op in &self.opponents {
-            for d in &op.discards {
-                left[d.idx() as usize] = left[d.idx() as usize].saturating_sub(1);
+        for m in self
+            .melds
+            .iter()
+            .chain(self.opponents.iter().flat_map(|op| &op.melds))
+        {
+            let mut counts = [0u8; TILE_COUNT];
+            m.add_to_counts(&mut counts);
+            if let Some(called) = m.called_tile {
+                counts[called.idx() as usize] = counts[called.idx() as usize].saturating_sub(1);
             }
-            for m in &op.melds {
-                let mut tmp = [0u8; TILE_COUNT];
-                m.add_to_counts(&mut tmp);
-                // For chi/pon/kan the called tile came from a discard pile we
-                // also count above. Subtract 1 for the called tile to avoid
-                // double counting.
-                if let Some(called) = m.called_tile {
-                    tmp[called.idx() as usize] = tmp[called.idx() as usize].saturating_sub(1);
-                }
-                for (l, t) in left.iter_mut().zip(tmp.iter()) {
-                    *l = l.saturating_sub(*t);
-                }
+            for (l, count) in left.iter_mut().zip(counts) {
+                *l = l.saturating_sub(count);
             }
         }
         // Dora indicators are always visible.
@@ -218,6 +218,7 @@ impl Default for PlayerInfo34 {
             hand: [0u8; TILE_COUNT],
             melds: Vec::new(),
             aka_count: 0,
+            aka_hand: [0; 3],
             dora_indicators: Vec::new(),
             bakaze: Tile34(super::tile::HONOR_E),
             jikaze: Tile34(super::tile::HONOR_E),
@@ -240,6 +241,7 @@ impl PlayerInfo34Builder {
         self.info.hand[t.idx() as usize] += 1;
         if mjai.ends_with('r') {
             self.info.aka_count += 1;
+            self.info.aka_hand[t.idx() as usize / 9] += 1;
         }
         self
     }
@@ -317,6 +319,38 @@ mod tests {
         let mut c2 = [0u8; TILE_COUNT];
         pon.add_to_counts(&mut c2);
         assert_eq!(c2[27], 3);
+    }
+
+    #[test]
+    fn rivers_and_called_tiles_are_counted_once() {
+        let tile = Tile34::from_mjai("1m").unwrap();
+        let pon = Meld34 {
+            kind: Meld34Kind::Pon,
+            tiles: vec![tile],
+            called_tile: Some(tile),
+            from_who: Some(1),
+            aka_count: 0,
+        };
+        let mut info = PlayerInfo34::default();
+        info.own_discards.push(tile);
+        assert_eq!(info.compute_left_tiles()[0], 3);
+
+        info.own_discards.clear();
+        info.melds.push(pon.clone());
+        info.opponents.push(OpponentInfo {
+            discards: vec![tile],
+            ..Default::default()
+        });
+        assert_eq!(info.compute_left_tiles()[0], 1);
+
+        info.melds.clear();
+        info.own_discards.push(tile);
+        info.opponents[0].discards.clear();
+        info.opponents[0].melds.push(Meld34 {
+            from_who: Some(0),
+            ..pon
+        });
+        assert_eq!(info.compute_left_tiles()[0], 1);
     }
 
     #[test]

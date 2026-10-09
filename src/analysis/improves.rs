@@ -154,6 +154,8 @@ fn compute_improves(
             continue;
         }
         probe[drawn] += 1;
+        let mut next_left = left;
+        next_left[drawn] -= 1;
         // Try discarding each tile in hand other than the just-drawn one.
         for d in 0..TILE_COUNT {
             if probe[d] == 0 {
@@ -166,7 +168,8 @@ fn compute_improves(
             probe[d] -= 1;
             let post_shanten = shanten::shanten_from_counts(&probe, len_div3);
             if post_shanten == cur_shanten {
-                let new_waits = waits::waits_for_counts(&probe, len_div3, &left, cur_shanten - 1);
+                let new_waits =
+                    waits::waits_for_counts(&probe, len_div3, &next_left, cur_shanten - 1);
                 let new_total = new_waits.total_left();
                 if new_total > waits_total {
                     improve_way_count += 1;
@@ -390,6 +393,24 @@ mod tests {
             r.improve_way_count
         );
         assert!(!r.improves.is_empty());
+    }
+
+    #[test]
+    fn improvements_exclude_the_simulated_draw_from_unseen_tiles() {
+        let info = PlayerInfo34Builder::new()
+            .add_many(&[
+                "2m", "3m", "4m", "2p", "3p", "4p", "6p", "7p", "2s", "3s", "4s", "1s", "9s",
+            ])
+            .build();
+        let left = info.compute_left_tiles();
+        let result = analyze_13(&info);
+        assert!(!result.improves.is_empty());
+        for improve in result.improves {
+            for wait in improve.widened_waits {
+                let idx = Tile34::from_mjai(&wait.tile).unwrap().idx() as usize;
+                assert_eq!(wait.left, left[idx] - u8::from(wait.tile == improve.draw));
+            }
+        }
     }
 
     #[test]

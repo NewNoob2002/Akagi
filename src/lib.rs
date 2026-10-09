@@ -353,12 +353,8 @@ pub fn run() {
                 let stop_state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
-                    let stop = {
-                        let mut ctl = stop_state.capture_control.lock().await;
-                        ctl.stop.take()
-                    };
-                    if let Some(tx) = stop {
-                        let _ = tx.send(());
+                    if let Err(e) = ipc::capture_supervisor::stop_capture(stop_state).await {
+                        warn!("terminal capture shutdown: {e:#}");
                     }
                 });
 

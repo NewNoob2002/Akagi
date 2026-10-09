@@ -106,7 +106,7 @@ fn main() -> Result<()> {
 
     let total = AtomicUsize::new(0);
 
-    let shard = |ci: usize, chunk: &[PathBuf]| -> Result<usize> {
+    let shard = |ci: usize, chunk: &[PathBuf]| -> Result<(usize, Vec<usize>)> {
         let create = |ext: &str| -> Result<BufWriter<File>> {
             let path = out_dir.join(format!("{ci}.{ext}"));
             let f = File::create(&path).with_context(|| format!("create {path:?}"))?;
@@ -116,6 +116,7 @@ fn main() -> Result<()> {
         let mut act_w = create("act")?;
         let mut msk_w = create("msk")?;
         let mut local = 0usize;
+        let mut game_samples = Vec::new();
 
         for path in chunk {
             if total.load(Ordering::Relaxed) >= max_samples {
@@ -155,6 +156,9 @@ fn main() -> Result<()> {
                 act_w.write_all(&g_act).context("write act shard")?;
                 msk_w.write_all(&g_msk).context("write mask shard")?;
                 local += g_n;
+                if g_n > 0 {
+                    game_samples.push(g_n);
+                }
                 total.fetch_add(g_n, Ordering::Relaxed);
             }
         }
@@ -162,7 +166,7 @@ fn main() -> Result<()> {
         obs_w.flush().context("flush obs shard")?;
         act_w.flush().context("flush act shard")?;
         msk_w.flush().context("flush mask shard")?;
-        Ok(local)
+        Ok((local, game_samples))
     };
 
     // Each game is guarded by `catch_unwind`; silence the default panic printer
@@ -172,13 +176,15 @@ fn main() -> Result<()> {
     // a read-only out_dir reports an error instead of exiting silently.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let shard_counts: Result<Vec<usize>> = chunks
+    let shard_data: Result<Vec<(usize, Vec<usize>)>> = chunks
         .par_iter()
         .enumerate()
         .map(|(ci, chunk)| shard(ci, chunk))
         .collect();
     std::panic::set_hook(prev_hook);
-    let shard_counts = shard_counts?;
+    let shard_data = shard_data?;
+    let shard_counts: Vec<usize> = shard_data.iter().map(|(count, _)| *count).collect();
+    let shard_games: Vec<&Vec<usize>> = shard_data.iter().map(|(_, games)| games).collect();
 
     let total_samples: usize = shard_counts.iter().sum();
     let meta = serde_json::json!({
@@ -190,6 +196,7 @@ fn main() -> Result<()> {
         "obs_scale": OBS_SCALE,
         "num_shards": chunks.len(),
         "shard_samples": shard_counts,
+        "shard_game_samples": shard_games,
         "total_samples": total_samples,
     });
     fs::write(out_dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;

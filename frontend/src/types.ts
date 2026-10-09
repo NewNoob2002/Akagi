@@ -442,6 +442,7 @@ export type OpponentRisk = {
 }
 
 export type AnalysisResult = {
+  revision: number
   seat: number
   turn: number
   shanten: number
@@ -478,6 +479,8 @@ export type PlayerSnapshot = {
   score: number
   riichi_declared: boolean
   riichi_stage: boolean
+  ippatsu: boolean
+  last_open_meld_discard_count: number
   double_riichi: boolean
   riichi_declaration_index: number | null
   /** 3p only: north tiles set aside via kita / nukidora. Empty in 4p. */
@@ -515,6 +518,12 @@ export type MahgenView = {
   /** 3 (sanma) or 4 (yonma). */
   num_players: number
   dora_indicators: string
+}
+
+export type GameUpdate = {
+  revision: number
+  game: GameStateSnapshot | null
+  view: MahgenView | null
 }
 
 /** Mirrors `crate::schema::HoraScoreInfo`. Returned by `compute_bot_hora_score`. */

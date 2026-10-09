@@ -74,53 +74,26 @@ fn meld_to_riichienv(m: &Meld34) -> RiMeld {
     )
 }
 
-/// Aka-dora sentinel offsets within a 136-id tile group: 5m=16, 5p=52, 5s=88,
-/// each at offset 0 of their tile-34 index. We skip these unless the player
-/// is holding a red copy.
-fn five_idx_with_aka(idx: u8) -> Option<u8> {
-    match idx {
-        4 | 13 | 22 => Some(0),
-        _ => None,
-    }
+/// Use an ordinary copy for shape conversion; red bonus is supplied separately.
+fn ordinary_id(tile: Tile34) -> u8 {
+    tile.idx() * 4 + u8::from(matches!(tile.idx(), 4 | 13 | 22))
 }
 
 fn build_evaluator(info: &PlayerInfo34) -> HandEvaluator {
-    // Materialise the closed hand as 136-tile ids. For 5m/5p/5s we steer
-    // around the aka-dora sentinel at offset 0 unless the player actually
-    // holds red copies — riichienv counts those sentinels as aka dora and
-    // would otherwise inject phantom han.
-    let mut tiles_136: Vec<u8> = Vec::new();
-    let aka_left = info.aka_count.min(3); // cap at 3 distinct red fives
-    let mut aka_remaining = aka_left;
-    for (idx_us, count) in info.hand.iter().enumerate() {
-        let idx = idx_us as u8;
-        let aka_offset = five_idx_with_aka(idx);
-        let want_aka = aka_offset.is_some() && aka_remaining > 0 && *count > 0;
-        let mut emitted = 0u8;
-        if want_aka {
-            tiles_136.push(idx * 4 + aka_offset.unwrap());
-            aka_remaining -= 1;
-            emitted += 1;
-        }
-        // Fill the rest with non-aka offsets (1, 2, 3 for fives; 0..count for everything else).
-        let start = if aka_offset.is_some() { 1 } else { 0 };
-        let mut off = start;
-        while emitted < *count {
-            // Skip the aka offset we already used (if any).
-            if Some(off) == aka_offset {
-                off += 1;
-                continue;
-            }
-            if off > 3 {
-                break;
-            }
-            tiles_136.push(idx * 4 + off);
-            off += 1;
-            emitted += 1;
-        }
-    }
-    let melds: Vec<RiMeld> = info.melds.iter().map(meld_to_riichienv).collect();
-    HandEvaluator::new(tiles_136, melds)
+    let tiles_136 = info
+        .hand
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, &count)| {
+            std::iter::repeat_n(ordinary_id(Tile34(idx as u8)), count as usize)
+        })
+        .collect();
+    let melds = info.melds.iter().map(meld_to_riichienv).collect();
+    let mut evaluator = HandEvaluator::new(tiles_136, melds);
+    // HandEvaluator exposes the red bonus independently of its shape counts.
+    // The adapter has already counted every real red copy, including melds.
+    evaluator.aka_dora_count = info.aka_count;
+    evaluator
 }
 
 /// Compute the point expectation across the wait set.
@@ -148,7 +121,9 @@ pub fn expectation(info: &PlayerInfo34, waits: &Waits, allow_riichi: bool) -> Sc
         if left == 0 {
             continue;
         }
-        let win_tile_136 = tile * 4;
+        // A 34-space wait carries no colour information. Estimate an ordinary
+        // winning copy rather than silently awarding an unseen red bonus.
+        let win_tile_136 = ordinary_id(Tile34(tile));
 
         let mut cond_dama = Conditions {
             round_wind,
@@ -246,6 +221,37 @@ mod tests {
             est.riichi_point,
             est.dama_point
         );
+    }
+
+    #[test]
+    fn ordinary_five_wait_has_no_phantom_red_bonus() {
+        let info = PlayerInfo34Builder::new()
+            .add_many(&[
+                "1m", "1m", "2m", "3m", "4m", "2p", "3p", "4p", "6p", "7p", "2s", "3s", "4s",
+            ])
+            .build();
+        let mut waits = Waits::new();
+        waits.insert(Tile34::from_mjai("5p").unwrap().idx(), 4);
+        assert_eq!(expectation(&info, &waits, false).dama_point, 5800.0);
+    }
+
+    #[test]
+    fn red_bonus_and_four_fives_are_preserved() {
+        let mut info = PlayerInfo34Builder::new().add_many(&["5p"; 4]).build();
+        let evaluator = build_evaluator(&info);
+        assert_eq!(evaluator.hand.counts[13], 4);
+        assert_eq!(evaluator.aka_dora_count, 0);
+        info.aka_count = 1;
+        assert_eq!(build_evaluator(&info).aka_dora_count, 1);
+        info.melds.push(Meld34 {
+            kind: Meld34Kind::Pon,
+            tiles: vec![Tile34(4)],
+            called_tile: Some(Tile34(4)),
+            from_who: Some(1),
+            aka_count: 1,
+        });
+        info.aka_count = 2;
+        assert_eq!(build_evaluator(&info).aka_dora_count, 2);
     }
 
     #[test]

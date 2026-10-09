@@ -21,8 +21,9 @@ use crate::capture::flow::FlowBridges;
 use crate::config::ChromiumConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Child;
 use tracing::{info, warn};
 
 pub struct ChromiumBackend {
@@ -74,6 +75,9 @@ impl ChromiumBackend {
 #[async_trait]
 impl CaptureBackend for ChromiumBackend {
     async fn run(self: Box<Self>, ctx: CaptureCtx, shutdown: ShutdownToken) -> Result<()> {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let exe = self
             .resolve_executable()
             .context("resolving chromium executable")?;
@@ -99,6 +103,9 @@ impl CaptureBackend for ChromiumBackend {
                 })?;
         }
 
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         info!(
             "chromium backend starting: exe={} profile={}",
             exe.display(),
@@ -109,10 +116,16 @@ impl CaptureBackend for ChromiumBackend {
             launch::spawn(&exe, &profile_dir, &self.cfg).context("launching chromium")?;
         let mut child = launched.child;
 
-        let cdp_endpoint =
-            launch::wait_for_devtools_endpoint(&profile_dir, launched.remote_debugging_port)
-                .await
-                .context("reading chromium CDP endpoint (chromium failed to start?)")?;
+        let Some(cdp_endpoint) = wait_for_endpoint(
+            &mut child,
+            &profile_dir,
+            launched.remote_debugging_port,
+            &shutdown,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         info!("chromium CDP endpoint: {cdp_endpoint}");
 
         let mut hooks = ctx
@@ -219,6 +232,56 @@ impl CaptureBackend for ChromiumBackend {
         CaptureDescriptor {
             kind: CaptureKind::Chromium,
             label,
+        }
+    }
+}
+
+/// Startup cancellation and failure must finish child cleanup before the
+/// supervisor allows a replacement. None means cancellation, not failure.
+async fn wait_for_endpoint(
+    child: &mut Child,
+    profile: &Path,
+    port: Option<u16>,
+    shutdown: &ShutdownToken,
+) -> Result<Option<String>> {
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.wait() => Ok(None),
+        endpoint = launch::wait_for_devtools_endpoint(profile, port) => endpoint.map(Some),
+    };
+    if !matches!(&result, Ok(Some(_))) {
+        launch::terminate(child).await;
+    }
+    result.context("reading chromium CDP endpoint (chromium failed to start?)")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_cancel_and_failure_reap_the_child() {
+        let profile = tempfile::tempdir().unwrap();
+        for cancelled in [true, false] {
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (shutdown, cancel) = ShutdownToken::new();
+            if cancelled {
+                cancel.send_replace(true);
+            }
+            let result = wait_for_endpoint(&mut child, profile.path(), None, &shutdown).await;
+            if cancelled {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("CDP endpoint"));
+            }
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "cleanup must reap the child"
+            );
         }
     }
 }

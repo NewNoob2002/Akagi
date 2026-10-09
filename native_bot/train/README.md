@@ -25,7 +25,8 @@ cargo build --release --no-default-features --features extract --bin extract
 ```
 
 Each output dir gets `N.obs` / `N.act` / `N.msk` shard files plus a `meta.json`
-describing the geometry and sample counts. Extraction is multi-threaded (rayon)
+describing the geometry, sample counts, and `shard_game_samples` (each game's
+contiguous sample count within its shard). Extraction is multi-threaded (rayon)
 and fast — millions of samples in seconds.
 
 Notes:
@@ -52,6 +53,13 @@ python train.py --data out/p3 --out ../weights/akagi3p.safetensors \
     --epochs 10 --batch 2048 --lr 1.5e-3
 ```
 
+`--val-frac` holds out a fraction of **whole games**, not individual actions;
+all seats and rounds from one log stay in the same partition. The split is
+reproducible with seed 0, requires at least two games with samples, and keeps
+both partitions non-empty. The sample fraction can differ from the game fraction.
+Old shards without `shard_game_samples` must be re-extracted; the trainer rejects
+them because their game boundaries cannot be recovered reliably.
+
 The model is a 1-D ResNet over the tile axis (`conv 64`, `3` residual blocks,
 `fc 256`) with a masked cross-entropy loss over legal actions. After training,
 BatchNorm is **folded into the preceding convolutions** so the exported model is
@@ -59,12 +67,21 @@ pure Conv1d + Linear — the candle side needs no BatchNorm op. A parity check
 asserts the fold preserves the argmax decisions.
 
 Reference numbers for exactly the commands above (40k games → 6.0M/4.0M samples,
-10 epochs, RTX 4070 Ti) — these are what the committed weights were trained with:
+10 epochs, RTX 4070 Ti) — these are what the committed weights were trained with.
+These historical validation accuracies used an action-level random split and
+can include correlated states from the same game; they are not comparable to
+the new whole-game validation split or a measure of playing strength:
 
 | | val top-1 | params | weights | train time |
 |---|---|---|---|---|
 | 4p | 75.9% | 660,050 | 2.6 MB | ~5 min |
 | 3p | 77.8% | 539,324 | 2.2 MB | ~3 min |
+
+Run the split regression checks without GPU or training dependencies:
+
+```sh
+python -m unittest discover -s native_bot/train -p 'test_data_split.py'
+```
 
 ## 3. Verify parity (Rust ⇄ Python)
 

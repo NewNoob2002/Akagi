@@ -27,7 +27,8 @@
 //!
 //! | Event             | Payload type                  |
 //! |-------------------|-------------------------------|
-//! | `mjai-event`       | `schema::MjaiEvent`           |
+//! | `game-update`      | `game_state::snapshot::GameUpdate` |
+//! | `mjai-event`       | `schema::MjaiEvent` (after Tracker) |
 //! | `bot-response`     | `bot::BotResponse`            |
 //! | `bot-status`       | `schema::BotStatus`           |
 //! | `capture-status`   | `schema::CaptureStatus`       |
@@ -61,7 +62,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>, state: AppState) -> Result<()> {
 }
 
 fn spawn_forwarders<R: Runtime>(app: AppHandle<R>, state: AppState) {
-    forward(app.clone(), state.mjai_bus.subscribe(), "mjai-event");
+    spawn_game_forwarder(app.clone(), state.clone());
     forward(
         app.clone(),
         state.bot_response_bus.subscribe(),
@@ -82,6 +83,33 @@ fn spawn_forwarders<R: Runtime>(app: AppHandle<R>, state: AppState) {
     // Status buses: forward AND snapshot into AppState.
     spawn_bot_status_forwarder(app.clone(), state.clone());
     spawn_capture_status_forwarder(app, state);
+}
+
+/// Forward only after Tracker application. Each update includes a snapshot
+/// and its rendered view from one lock acquisition and one revision.
+fn spawn_game_forwarder<R: Runtime>(app: AppHandle<R>, state: AppState) {
+    let mut rx = state.post_tracker_bus.subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.state_valid {
+                        if let Err(e) = app.emit("mjai-event", &event.event) {
+                            warn!("ipc emit mjai-event failed: {e}");
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("game forwarder lagged by {n}; refreshing snapshot");
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+            let update = state.game_tracker.lock().await.game_update();
+            if let Err(e) = app.emit("game-update", &update) {
+                warn!("ipc emit game-update failed: {e}");
+            }
+        }
+    });
 }
 
 /// Plain forwarder: subscribe, drain, emit. `Lagged` is logged once and
@@ -131,12 +159,12 @@ fn spawn_bot_status_forwarder<R: Runtime>(app: AppHandle<R>, state: AppState) {
 
 fn spawn_capture_status_forwarder<R: Runtime>(app: AppHandle<R>, state: AppState) {
     let mut rx = state.capture_status_bus.subscribe();
-    let control = state.capture_control.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(s) => {
-                    control.lock().await.status = s.clone();
+                    // The supervisor owns the snapshot. Replaying a queued
+                    // status here could overwrite a newer run's status.
                     if let Err(e) = app.emit("capture-status", &s) {
                         warn!("ipc emit capture-status failed: {e}");
                     }

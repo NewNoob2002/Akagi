@@ -70,9 +70,12 @@ pub struct GameTracker {
     rule: GameRule,
     /// The bot's own seat, captured from `start_game.id`.
     our_seat: Option<u8>,
+    /// River lengths at the most recent open calls, reset at each round.
+    last_open_meld_discard_count: [usize; 4],
     /// Total events fed since process start. Useful for "is the bridge
     /// alive?" checks; not reset on game boundaries.
     pub events_seen: u64,
+    synchronised: bool,
 }
 
 impl GameTracker {
@@ -81,15 +84,28 @@ impl GameTracker {
             state: None,
             rule: GameRule::default_tenhou(),
             our_seat: None,
+            last_open_meld_discard_count: [0; 4],
             events_seen: 0,
+            synchronised: true,
         }
     }
 
     /// Drive one event through the engine. `Ok(())` even when the event
-    /// is a no-op (e.g. `MjaiEvent::None`) — the only error path is a
-    /// JSON conversion failure, which means a malformed event.
+    /// is a no-op (e.g. `MjaiEvent::None`). Malformed conversion or an
+    /// out-of-range open-call actor returns an error for the driver to invalidate.
     pub fn handle(&mut self, ev: &AkagiEvent) -> Result<()> {
         self.events_seen += 1;
+        if matches!(ev, AkagiEvent::StartGame { .. }) {
+            self.synchronised = true;
+        } else if !self.synchronised {
+            return Ok(());
+        }
+        if matches!(
+            ev,
+            AkagiEvent::StartGame { .. } | AkagiEvent::StartKyoku { .. }
+        ) {
+            self.last_open_meld_discard_count = [0; 4];
+        }
 
         if let AkagiEvent::StartGame {
             id, num_players, ..
@@ -144,6 +160,22 @@ impl GameTracker {
             }
             _ => None,
         };
+
+        let open_call_actor = match ev {
+            AkagiEvent::Chi { actor, .. }
+            | AkagiEvent::Pon { actor, .. }
+            | AkagiEvent::Daiminkan { actor, .. }
+            | AkagiEvent::Kakan { actor, .. } => Some(*actor as usize),
+            _ => None,
+        };
+        if let (Some(actor), Some(state)) = (open_call_actor, self.state.as_ref()) {
+            let count = match state {
+                TrackedGame::Four(s) => s.players.get(actor).map(|p| p.discards.len()),
+                TrackedGame::Three(s) => s.players.get(actor).map(|p| p.discards.len()),
+            }
+            .ok_or_else(|| anyhow::anyhow!("open-call actor {actor} out of range"))?;
+            self.last_open_meld_discard_count[actor] = count;
+        }
 
         let Some(ri) = convert::to_riichienv(ev)? else {
             return Ok(()); // Skipped (e.g. MjaiEvent::None).
@@ -217,13 +249,47 @@ impl GameTracker {
         Ok(())
     }
 
+    /// Missing events invalidate all derived state until StartGame establishes
+    /// a fresh perspective. StartKyoku alone cannot recover a lost seat/game.
+    pub fn invalidate(&mut self) {
+        self.state = None;
+        self.our_seat = None;
+        self.last_open_meld_discard_count = [0; 4];
+        self.synchronised = false;
+        self.events_seen += 1;
+    }
+
+    pub fn is_synchronised(&self) -> bool {
+        self.synchronised
+    }
+
     /// Snapshot of the current state. Returns `None` if no game has
     /// started yet.
     pub fn snapshot(&self) -> Option<GameStateSnapshot> {
-        self.state.as_ref().map(|tg| match tg {
-            TrackedGame::Four(s) => GameStateSnapshot::from_state(s, self.our_seat),
-            TrackedGame::Three(s) => GameStateSnapshot::from_state_3p(s, self.our_seat),
+        self.state.as_ref().map(|tg| {
+            let mut snapshot = match tg {
+                TrackedGame::Four(s) => GameStateSnapshot::from_state(s, self.our_seat),
+                TrackedGame::Three(s) => GameStateSnapshot::from_state_3p(s, self.our_seat),
+            };
+            for player in &mut snapshot.players {
+                player.last_open_meld_discard_count =
+                    self.last_open_meld_discard_count[player.seat as usize];
+            }
+            snapshot
         })
+    }
+
+    /// Snapshot and view are constructed under the caller's tracker lock.
+    pub fn game_update(&self) -> crate::game_state::snapshot::GameUpdate {
+        let game = self.snapshot();
+        let view = game
+            .as_ref()
+            .map(crate::game_state::MahgenView::from_snapshot);
+        crate::game_state::snapshot::GameUpdate {
+            revision: self.events_seen,
+            game,
+            view,
+        }
     }
 
     /// The captured observer seat, or `None` if no `start_game.id` arrived.
@@ -454,20 +520,32 @@ async fn run(
                 // later one. A burst of events from one frame is applied in
                 // microseconds; anything that asks afterwards has already
                 // missed the state it meant to ask about.
-                let can_act = {
+                let (can_act, state_valid) = {
                     let mut t = tracker.lock().await;
                     if let Err(e) = t.handle(&ev) {
                         warn!("game tracker: handle error: {e:#}");
+                        t.invalidate();
                     }
-                    t.our_seat_can_act()
+                    (t.our_seat_can_act(), t.is_synchronised())
                 };
                 if let Some(p) = &post {
-                    // Receiver may have lagged or no-one subscribed yet — ignore.
-                    let _ = p.send(TrackedEvent { event: ev, can_act });
+                    let _ = p.send(TrackedEvent {
+                        event: ev,
+                        can_act,
+                        state_valid,
+                    });
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("game tracker lagged behind MJAI bus by {n} events");
+                warn!("game tracker lagged behind MJAI bus by {n} events; invalidating state");
+                tracker.lock().await.invalidate();
+                if let Some(p) = &post {
+                    let _ = p.send(TrackedEvent {
+                        event: AkagiEvent::None,
+                        can_act: Some(false),
+                        state_valid: false,
+                    });
+                }
             }
             Err(broadcast::error::RecvError::Closed) => {
                 info!("MJAI bus closed; game tracker exiting");
@@ -543,6 +621,138 @@ mod tests {
             pai: pai.into(),
             tsumogiri: false,
         }
+    }
+
+    #[test]
+    fn game_update_uses_one_revision_and_clears_both_views() {
+        let mut t = GameTracker::new();
+        t.handle(&start_game()).unwrap();
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        let update = t.game_update();
+        assert_eq!(update.revision, 2);
+        assert_eq!(
+            serde_json::to_value(update.view).unwrap(),
+            serde_json::to_value(crate::game_state::MahgenView::from_snapshot(
+                update.game.as_ref().unwrap()
+            ))
+            .unwrap()
+        );
+        t.invalidate();
+        let update = t.game_update();
+        assert_eq!(update.revision, 3);
+        assert!(update.game.is_none() && update.view.is_none());
+    }
+
+    #[test]
+    fn invalid_state_stays_empty_until_a_new_game() {
+        let mut t = GameTracker::new();
+        t.handle(&start_game()).unwrap();
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        t.invalidate();
+        assert!(t.snapshot().is_none());
+        assert!(t.our_seat_can_act().is_none());
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        t.handle(&dahai(1, "E")).unwrap();
+        assert!(t.snapshot().is_none());
+        t.handle(&start_game()).unwrap();
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        assert!(t.snapshot().is_some());
+        assert!(t.is_synchronised());
+    }
+
+    #[tokio::test]
+    async fn bus_overflow_invalidates_and_notifies_consumers() {
+        let (tx, rx) = broadcast::channel(2);
+        let (post, mut received) = broadcast::channel(16);
+        let tracker = new_handle();
+        tracker.lock().await.handle(&start_game()).unwrap();
+        for _ in 0..4 {
+            tx.send(AkagiEvent::None).unwrap();
+        }
+        drop(tx);
+        drive_loop(tracker.clone(), rx, Some(post)).await;
+        let event = received.recv().await.unwrap();
+        assert!(!event.state_valid);
+        assert!(tracker.lock().await.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_call_invalidates_instead_of_killing_the_tracker() {
+        let (tx, rx) = broadcast::channel(2);
+        let (post, mut received) = broadcast::channel(2);
+        let tracker = new_handle();
+        tracker.lock().await.handle(&start_game()).unwrap();
+        tx.send(AkagiEvent::Pon {
+            actor: 4,
+            target: 0,
+            pai: "E".into(),
+            consumed: ["E".into(), "E".into()],
+        })
+        .unwrap();
+        drop(tx);
+        drive_loop(tracker.clone(), rx, Some(post)).await;
+        assert!(!received.recv().await.unwrap().state_valid);
+        assert!(tracker.lock().await.snapshot().is_none());
+    }
+
+    #[test]
+    fn open_call_timing_tracks_the_last_call_and_resets() {
+        let mut t = GameTracker::new();
+        t.handle(&start_game()).unwrap();
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        for tile in ["1p", "2p", "3p", "4p", "9p"] {
+            t.handle(&dahai(1, tile)).unwrap();
+        }
+        t.handle(&AkagiEvent::Pon {
+            actor: 1,
+            target: 2,
+            pai: "E".into(),
+            consumed: ["E".into(), "E".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            t.snapshot().unwrap().players[1].last_open_meld_discard_count,
+            5
+        );
+        t.handle(&dahai(1, "8p")).unwrap();
+        t.handle(&AkagiEvent::Kakan {
+            actor: 1,
+            pai: "E".into(),
+            consumed: ["E".into(), "E".into(), "E".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            t.snapshot().unwrap().players[1].last_open_meld_discard_count,
+            6
+        );
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        assert_eq!(
+            t.snapshot().unwrap().players[1].last_open_meld_discard_count,
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_ippatsu_follows_riichi_and_calls() {
+        let mut t = GameTracker::new();
+        t.handle(&start_game()).unwrap();
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        t.handle(&AkagiEvent::Reach {
+            actor: 1,
+            pai: None,
+        })
+        .unwrap();
+        t.handle(&dahai(1, "8p")).unwrap();
+        t.handle(&AkagiEvent::ReachAccepted { actor: 1 }).unwrap();
+        assert!(t.snapshot().unwrap().players[1].ippatsu);
+        t.handle(&AkagiEvent::Pon {
+            actor: 0,
+            target: 2,
+            pai: "1m".into(),
+            consumed: ["1m".into(), "1m".into()],
+        })
+        .unwrap();
+        assert!(!t.snapshot().unwrap().players[1].ippatsu);
     }
 
     #[test]

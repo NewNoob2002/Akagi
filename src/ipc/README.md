@@ -30,10 +30,12 @@ via `tauri::State<AppState>`) and spawns one forwarder task per bus.
 
 | Event name      | Payload                            | Source                             |
 |-----------------|------------------------------------|------------------------------------|
-| `mjai-event`    | `schema::MjaiEvent`                | proxy bridge → `event_bus::MjaiBus` |
+| `mjai-event`    | `schema::MjaiEvent`                | Tracker → `PostTrackerBus` (valid events only) |
+| `game-update`   | `game_state::snapshot::GameUpdate` | Tracker snapshot + view at one revision |
+| `analysis-result` | `analysis::AnalysisResult`       | Analysis runner → `AnalysisBus` (includes revision) |
 | `bot-response`  | `bot::BotResponse`                 | `BotManager` → `BotResponseBus`    |
 | `bot-status`    | `schema::BotStatus`                | `BotManager` → `BotStatusBus`      |
-| `proxy-status`  | `schema::ProxyStatus`              | `proxy_supervisor` → `ProxyStatusBus` |
+| `capture-status` | `schema::CaptureStatus`           | `capture_supervisor` → `CaptureStatusBus` |
 | `notify`        | `schema::Notification`             | any subsystem → `NotifyBus`        |
 | `overlay-config`| `config::OverlayConfig`            | `overlay::reconcile` → every webview |
 
@@ -52,9 +54,11 @@ await listen<BotStatus>("bot-status", e => store.setBotStatus(e.payload));
 await listen<Notification>("notify", e => toast(e.payload));
 ```
 
-Status buses are *also* mirrored into `AppState` snapshots so the
-frontend can recover the current state on reload via `get_status`
-without waiting for the next event.
+Bot status is mirrored into `AppState`; the capture supervisor owns its
+status snapshot. The frontend recovers these through `get_status`. Game
+snapshot and view are hydrated together with `get_game_update`; revision checks
+reject late replies. Analysis is displayed only for the current game revision.
+Async listener registrations are disposed even when they finish after unmount.
 
 ## Commands callable from the frontend
 
@@ -70,9 +74,12 @@ without waiting for the next event.
 | `update_bot_from_manifest` | `name`            | `BotInfo`                | Reinstall from the source declared in the bot's `manifest.toml` |
 | `sync_bot_deps`  | `name, force`         | `()`                     | Re-runs `uv sync` for an installed bot. `force=true` wipes `.akagi/synced.stamp` and `.akagi/venv/` first (used by the per-bot Reinstall environment button). Per-bot `SyncGuard` rejects concurrent calls. |
 | `delete_bot`     | `name`                | `()`                     | Refuses if the bot is the active 4p/3p; refuses paths that escape `bot.dir` |
-| `start_proxy`    | —                     | `()` / `Err("…running")` | Spawns supervisor; idempotent guard |
-| `stop_proxy`     | —                     | `()`                     | Sends shutdown to current proxy task |
-| `get_status`     | —                     | `Snapshot`               | One-shot dump (config, bot_status, proxy_status, log_dir) |
+| `start_capture` | —                     | `()` / `Err("…running")` | Serialised supervisor start |
+| `stop_capture`  | —                     | `()` / `Err("…")`       | Cancels and waits for cleanup; 20-second timeout retains the stopping run |
+| `restart_capture` | —                  | `()` / `Err("…")`       | Starts replacement only after previous cleanup |
+| `get_game_update` | —                    | `GameUpdate`             | Snapshot + rendered view + revision from one tracker lock |
+| `get_analysis`  | —                     | `Option<AnalysisResult>` | Current-revision cache only; None for invalid state |
+| `get_status`    | —                     | `Snapshot`               | Config, bot_status, capture_status, log_dir |
 | `get_log_dir`    | —                     | `PathBuf`                | Current log session directory|
 
 Errors are returned as `String` so the frontend can put them straight

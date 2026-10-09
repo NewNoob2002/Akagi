@@ -1,18 +1,8 @@
 import { useEffect } from 'react'
-import { HAS_TAURI, invoke, listen } from '@/lib/tauri'
+import { HAS_TAURI, createEventScope, invoke } from '@/lib/tauri'
 import type {
-  AnalysisResult,
-  BotResponse,
-  BotStatus,
-  CaptureStatus,
-  GameRecord,
-  GameStateSnapshot,
-  HistoryEvent,
-  MahgenView,
-  MjaiEvent,
-  Notification,
-  OverlayConfig,
-  Snapshot,
+  AnalysisResult, BotResponse, BotStatus, CaptureStatus, GameRecord,
+  GameUpdate, HistoryEvent, MjaiEvent, Notification, OverlayConfig, Snapshot,
 } from '@/types'
 import { useGameStore } from '@/stores/gameStore'
 import { useAnalysisStore } from '@/stores/analysisStore'
@@ -25,139 +15,139 @@ import { useConfigStore } from '@/stores/configStore'
 import { useHistoryStore } from '@/stores/historyStore'
 import { toast, type ToastSeverity } from '@/components/ui/sonner'
 
-// Backend `Notification.level` ∈ {info,success,warn,error}; toast helper
-// uses `warning`. Map across.
 const TOAST_SEVERITY: Record<Notification['level'], ToastSeverity> = {
-  info: 'info',
-  success: 'success',
-  warn: 'warning',
-  error: 'error',
+  info: 'info', success: 'success', warn: 'warning', error: 'error',
 }
 
-// One-shot bridge mounted from <App>. Subscribes to all Tauri events,
-// hydrates initial state, and unsubscribes on unmount.
+// Register streams before hydrating. Revisions prevent late IPC replies from
+// overwriting a newer game/analysis event, including after window remounts.
 export function useTauriBridge() {
   useEffect(() => {
     if (!HAS_TAURI) return
-
-    const unlistens: Array<() => void> = []
+    const scope = createEventScope()
     let cancelled = false
-
-    const refreshGame = async () => {
-      try {
-        const [snap, view] = await Promise.all([
-          invoke<GameStateSnapshot | null>('get_game_snapshot'),
-          invoke<MahgenView | null>('get_mahgen_view'),
-        ])
-        if (cancelled) return
-        useGameStore.getState().setGame(snap)
-        useGameStore.getState().setView(view)
-      } catch {
-        /* ignore: backend may not be ready */
+    let liveBotStatus = false
+    let liveCaptureStatus = false
+    let liveOverlay = false
+    let historyLoaded = false
+    let pendingAnalysis: AnalysisResult | null = null
+    const historyPending: HistoryEvent[] = []
+    const applyHistory = (ev: HistoryEvent) => {
+      if (ev.kind === 'recorded') useHistoryStore.getState().prepend(ev.record)
+      else if (ev.kind === 'deleted') useHistoryStore.getState().remove(ev.id)
+    }
+    const applyGame = (update: GameUpdate) => {
+      if (update.revision < useGameStore.getState().revision) return
+      useGameStore.getState().setUpdate(update)
+      if (!update.game || (useAnalysisStore.getState().result?.revision ?? -1) < update.revision) {
+        useAnalysisStore.getState().set(null)
+      }
+      if (pendingAnalysis && pendingAnalysis.revision <= update.revision) {
+        if (update.game && pendingAnalysis.revision === update.revision) {
+          useAnalysisStore.getState().set(pendingAnalysis)
+        }
+        pendingAnalysis = null
       }
     }
-
-    ;(async () => {
+    const applyAnalysis = (result: AnalysisResult | null) => {
+      if (!result) return
+      const { revision, game } = useGameStore.getState()
+      if (game && result.revision === revision) useAnalysisStore.getState().set(result)
+      else if (result.revision > revision && result.revision >= (pendingAnalysis?.revision ?? -1)) {
+        pendingAnalysis = result
+      }
+    }
+    const subscriptions = [
+      scope.listen<MjaiEvent>('mjai-event', (e) => {
+        if (e.type === 'start_game') useApiStatusStore.getState().reset()
+        useNotifyStore.getState().pushEvent(e)
+      }),
+      scope.listen<GameUpdate>('game-update', applyGame),
+      scope.listen<AnalysisResult>('analysis-result', applyAnalysis),
+      scope.listen<BotStatus>('bot-status', (s) => {
+        liveBotStatus = true
+        useBotStore.getState().setStatus(s)
+      }),
+      scope.listen<CaptureStatus>('capture-status', (s) => {
+        liveCaptureStatus = true
+        useCaptureStore.getState().set(s)
+      }),
+      scope.listen<BotResponse>('bot-response', (r) => useNotifyStore.getState().pushResponse(r)),
+      scope.listen<OverlayConfig>('overlay-config', (o) => {
+        liveOverlay = true
+        useConfigStore.getState().setOverlay(o)
+      }),
+      scope.listen<HistoryEvent>('history-recorded', (ev) => {
+        if (historyLoaded) applyHistory(ev)
+        else historyPending.push(ev)
+      }),
+      scope.listen<Notification>('notify', (n) => {
+        useNotifyStore.getState().pushToast(n)
+        if (n.id === 'native-api-health') {
+          useApiStatusStore.getState().setDegraded(n.level === 'warn' || n.level === 'error', n.body)
+        }
+        if (n.id && (n.id.startsWith('bot-install-') || n.id.startsWith('bot-sync-'))) {
+          useInstallStore.getState().setProgress(n)
+        }
+        toast[TOAST_SEVERITY[n.level]](n.title, {
+          description: n.body, id: n.id,
+          ...(n.sticky ? { duration: Infinity } : {}),
+        })
+      }),
+    ]
+    void (async () => {
+      const registered = await Promise.allSettled(subscriptions)
+      if (cancelled) return
+      for (const result of registered) {
+        if (result.status === 'rejected') console.error('Tauri event registration failed', result.reason)
+      }
       try {
         const status = await invoke<Snapshot>('get_status')
         if (cancelled) return
+        const overlay = useConfigStore.getState().config?.overlay
         useConfigStore.getState().setConfig(status.config)
+        if (liveOverlay && overlay) useConfigStore.getState().setOverlay(overlay)
         useConfigStore.getState().setLogDir(status.log_dir)
-        useBotStore.getState().setStatus(status.bot_status)
-        useCaptureStore.getState().set(status.capture_status)
-      } catch {
-        /* ignore */
+        if (!liveBotStatus) useBotStore.getState().setStatus(status.bot_status)
+        if (!liveCaptureStatus) useCaptureStore.getState().set(status.capture_status)
+      } catch (error) {
+        console.error('Tauri status hydration failed', error)
       }
-      await refreshGame()
+      if (cancelled) return
       try {
-        const a = await invoke<AnalysisResult | null>('get_analysis')
-        if (!cancelled) useAnalysisStore.getState().set(a)
-      } catch {
-        /* ignore */
+        const update = await invoke<GameUpdate>('get_game_update')
+        if (!cancelled) applyGame(update)
+      } catch (error) {
+        console.error('Tauri game hydration failed', error)
       }
-      // Game history: load all records once at startup. The History
-      // tab is the only consumer; loading lazily there forces a
-      // round-trip on first nav, so do it eagerly while the bridge
-      // is warm. Explicit large `limit` defends against any backend
-      // version that still applies a default cap on `limit=0`.
+      if (cancelled) return
+      try {
+        const analysis = await invoke<AnalysisResult | null>('get_analysis')
+        if (!cancelled) applyAnalysis(analysis)
+      } catch (error) {
+        console.error('Tauri analysis hydration failed', error)
+      }
+      if (cancelled) return
       try {
         useHistoryStore.getState().setLoading(true)
         const records = await invoke<GameRecord[]>('list_game_history', {
-          filter: null,
-          limit: 1_000_000,
-          offset: 0,
+          filter: null, limit: 1_000_000, offset: 0,
         })
         if (!cancelled) useHistoryStore.getState().setRecords(records)
-      } catch {
-        /* ignore: store stays empty */
+      } catch (error) {
+        console.error('Tauri history hydration failed', error)
       } finally {
-        useHistoryStore.getState().setLoading(false)
+        if (!cancelled) {
+          historyLoaded = true
+          historyPending.forEach(applyHistory)
+          historyPending.length = 0
+          useHistoryStore.getState().setLoading(false)
+        }
       }
     })()
-
-    listen<MjaiEvent>('mjai-event', (e) => {
-      // Fresh game: clear any lingering online-API outage from the last one.
-      if (e.type === 'start_game') useApiStatusStore.getState().reset()
-      useNotifyStore.getState().pushEvent(e)
-      void refreshGame()
-    }).then((u) => unlistens.push(u))
-
-    listen<AnalysisResult>('analysis-result', (a) => {
-      useAnalysisStore.getState().set(a)
-    }).then((u) => unlistens.push(u))
-
-    listen<BotStatus>('bot-status', (s) => {
-      useBotStore.getState().setStatus(s)
-    }).then((u) => unlistens.push(u))
-
-    listen<CaptureStatus>('capture-status', (s) => {
-      useCaptureStore.getState().set(s)
-    }).then((u) => unlistens.push(u))
-
-    listen<BotResponse>('bot-response', (r) => {
-      useNotifyStore.getState().pushResponse(r)
-    }).then((u) => unlistens.push(u))
-
-    // The overlay window can turn itself off (its × button). Mirror that back
-    // into the config store so the Game page's toggle doesn't keep claiming the
-    // overlay is open.
-    listen<OverlayConfig>('overlay-config', (o) => {
-      useConfigStore.getState().setOverlay(o)
-    }).then((u) => unlistens.push(u))
-
-    listen<HistoryEvent>('history-recorded', (ev) => {
-      if (ev.kind === 'recorded') {
-        useHistoryStore.getState().prepend(ev.record)
-      } else if (ev.kind === 'deleted') {
-        useHistoryStore.getState().remove(ev.id)
-      }
-    }).then((u) => unlistens.push(u))
-
-    listen<Notification>('notify', (n) => {
-      useNotifyStore.getState().pushToast(n)
-      // Drive the persistent "Online API" health indicator (Statusbar) off the
-      // same channel the backend uses for degrade/recover toasts.
-      if (n.id === 'native-api-health') {
-        useApiStatusStore
-          .getState()
-          .setDegraded(n.level === 'warn' || n.level === 'error', n.body)
-      }
-      // Feed env install/sync progress to the blocking overlay (which is
-      // shown for the duration of `withInstallBlock`). Ids: `bot-install-*`
-      // (GitHub install/reinstall) and `bot-sync-*` ("Reinstall environment").
-      if (n.id && (n.id.startsWith('bot-install-') || n.id.startsWith('bot-sync-'))) {
-        useInstallStore.getState().setProgress(n)
-      }
-      toast[TOAST_SEVERITY[n.level]](n.title, {
-        description: n.body,
-        id: n.id,
-        ...(n.sticky ? { duration: Infinity } : {}),
-      })
-    }).then((u) => unlistens.push(u))
-
     return () => {
       cancelled = true
-      unlistens.forEach((u) => u())
+      scope.dispose()
     }
   }, [])
 }

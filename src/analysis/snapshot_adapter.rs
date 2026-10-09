@@ -5,10 +5,8 @@
 //! engine wants 34-space tile counts, `Tile34` indices, and `Meld34`
 //! structs, so this module bridges the two.
 //!
-//! Some signals the analysis engine consumes (per-discard tedashi flag,
-//! ippatsu eligibility, called-from-others) are not represented in the
-//! snapshot today. We fill them with conservative defaults; the risk
-//! engine still produces useful output, just slightly more pessimistic.
+//! Discard timing and ippatsu eligibility come from the tracked snapshot.
+//! Rivers retain claimed tiles so genbutsu and furiten use the full history.
 
 use anyhow::{anyhow, Result};
 
@@ -26,14 +24,6 @@ fn count_aka_in_strings(tiles: &[String]) -> u8 {
     tiles.iter().filter(|t| t.ends_with('r')).count() as u8
 }
 
-fn count_aka_in_tile(tile: &str) -> u8 {
-    if tile.ends_with('r') {
-        1
-    } else {
-        0
-    }
-}
-
 /// Build a Meld34 from the snapshot view of a meld.
 fn meld_from_snapshot(m: &MeldSnapshot) -> Result<Meld34> {
     let kind = match m.kind {
@@ -43,8 +33,8 @@ fn meld_from_snapshot(m: &MeldSnapshot) -> Result<Meld34> {
         SnapMeldKind::Ankan => Meld34Kind::Ankan,
         SnapMeldKind::Kakan => Meld34Kind::Kakan,
     };
-    let aka_in_meld = count_aka_in_strings(&m.tiles)
-        + m.called_tile.as_deref().map(count_aka_in_tile).unwrap_or(0);
+    // Snapshot tiles already contain the claimed tile.
+    let aka_in_meld = count_aka_in_strings(&m.tiles);
     let tiles: Vec<Tile34> = m
         .tiles
         .iter()
@@ -76,19 +66,24 @@ fn meld_from_snapshot(m: &MeldSnapshot) -> Result<Meld34> {
     })
 }
 
-/// Convert a player's tehai (mjai strings) to a 34-counts vector and the aka
-/// red-five count.
-fn hand_from_tehai(tehai: &[String]) -> Result<(Counts34, u8)> {
+/// Convert concealed mjai tiles to shape counts and red counts per suit.
+fn hand_from_tehai(tehai: &[String]) -> Result<(Counts34, [u8; 3])> {
     let mut counts = [0u8; TILE_COUNT];
-    let mut aka = 0u8;
+    let mut aka_hand = [0u8; 3];
     for s in tehai {
         let t = parse_tile(s)?;
+        if counts[t.idx() as usize] >= 4 {
+            return Err(anyhow!("more than four copies of {s}"));
+        }
         counts[t.idx() as usize] += 1;
         if s.ends_with('r') {
-            aka += 1;
+            if !matches!(t.idx(), 4 | 13 | 22) {
+                return Err(anyhow!("invalid red tile: {s}"));
+            }
+            aka_hand[t.idx() as usize / 9] += 1;
         }
     }
-    Ok((counts, aka))
+    Ok((counts, aka_hand))
 }
 
 /// Compute a player's seat wind tile (`E`/`S`/`W`/`N`) given the dealer seat
@@ -121,9 +116,10 @@ fn build_opponent(snap: &GameStateSnapshot, p: &PlayerSnapshot) -> Result<Oppone
         discards,
         tedashi,
         melds,
+        last_open_meld_discard_count: p.last_open_meld_discard_count,
         is_riichi: p.riichi_declared,
         riichi_turn: p.riichi_declaration_index.map(|i| i as u8),
-        can_ippatsu: false,
+        can_ippatsu: p.ippatsu,
         jikaze: jikaze_for(p.seat, snap.oya, snap.num_players),
         called_from: vec![],
     })
@@ -135,7 +131,7 @@ pub fn to_player_info(snap: &GameStateSnapshot, seat: u8) -> Result<PlayerInfo34
         return Err(anyhow!("seat {seat} out of range"));
     }
     let me = &snap.players[seat as usize];
-    let (hand, aka) = hand_from_tehai(&me.tehai)?;
+    let (hand, aka_hand) = hand_from_tehai(&me.tehai)?;
     let melds = me
         .melds
         .iter()
@@ -164,7 +160,8 @@ pub fn to_player_info(snap: &GameStateSnapshot, seat: u8) -> Result<PlayerInfo34
         seat,
         hand,
         melds,
-        aka_count: aka + melds_aka_total,
+        aka_count: aka_hand.iter().sum::<u8>() + melds_aka_total,
+        aka_hand,
         dora_indicators,
         bakaze,
         jikaze,
@@ -193,6 +190,8 @@ mod tests {
             score: 25_000,
             riichi_declared: false,
             riichi_stage: false,
+            ippatsu: false,
+            last_open_meld_discard_count: 0,
             double_riichi: false,
             riichi_declaration_index: None,
             kita_tiles: vec![],
@@ -261,11 +260,33 @@ mod tests {
         ]);
         let info = to_player_info(&snap, 0).unwrap();
         assert_eq!(info.aka_count, 1);
+        assert_eq!(info.aka_hand, [1, 0, 0]);
+    }
+
+    #[test]
+    fn called_red_tile_is_counted_once() {
+        let meld = MeldSnapshot {
+            kind: SnapMeldKind::Pon,
+            tiles: ["5mr", "5m", "5m"].map(String::from).to_vec(),
+            from_who: 1,
+            called_tile: Some("5mr".into()),
+        };
+        assert_eq!(meld_from_snapshot(&meld).unwrap().aka_count, 1);
+    }
+
+    #[test]
+    fn opponent_timing_and_ippatsu_are_preserved() {
+        let mut snap = snap_with_player_0_hand(vec!["1m"]);
+        snap.players[1].last_open_meld_discard_count = 5;
+        snap.players[1].ippatsu = true;
+        let info = to_player_info(&snap, 0).unwrap();
+        assert_eq!(info.opponents[0].last_open_meld_discard_count, 5);
+        assert!(info.opponents[0].can_ippatsu);
     }
 
     #[test]
     fn dora_indicators_carry_through() {
-        let snap = snap_with_player_0_hand(vec!["1m"; 13]);
+        let snap = snap_with_player_0_hand(vec!["1m"]);
         let info = to_player_info(&snap, 0).unwrap();
         assert_eq!(info.dora_indicators.len(), 1);
         assert_eq!(info.dora_indicators[0].to_mjai(), "2m");
@@ -273,7 +294,7 @@ mod tests {
 
     #[test]
     fn opponent_seats_excluded_from_self() {
-        let snap = snap_with_player_0_hand(vec!["1m"; 13]);
+        let snap = snap_with_player_0_hand(vec!["1m"]);
         let info = to_player_info(&snap, 0).unwrap();
         let seats: Vec<u8> = info.opponents.iter().map(|o| o.seat).collect();
         assert_eq!(seats, vec![1, 2, 3]);

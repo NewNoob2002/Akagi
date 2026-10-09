@@ -1,18 +1,18 @@
 import { create } from 'zustand'
-import type { GameStateSnapshot, MahgenView } from '@/types'
+import type { GameStateSnapshot, GameUpdate, MahgenView } from '@/types'
 
 type GameStore = {
   game: GameStateSnapshot | null
   view: MahgenView | null
-  setGame: (g: GameStateSnapshot | null) => void
-  setView: (v: MahgenView | null) => void
+  revision: number
+  setUpdate: (update: GameUpdate) => void
 }
 
 export const useGameStore = create<GameStore>((set) => ({
   game: null,
   view: null,
-  setGame: (game) => set({ game }),
-  setView: (view) => set({ view }),
+  revision: -1,
+  setUpdate: (update) => set((current) => update.revision < current.revision ? current : update),
 }))
 
 /** Active player count for the current game. Defaults to 4 when no game is in

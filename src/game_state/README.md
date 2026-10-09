@@ -44,13 +44,12 @@ This module:
 Spawned from `lib.rs` once the MJAI bus exists:
 
 ```rust
-let tracker = game_state::spawn(mjai_bus.subscribe());
-// tracker: Arc<Mutex<GameTracker>>
-//   → IPC commands (future) read snapshot via `tracker.lock().await.snapshot()`
+let tracker = game_state::spawn_with_post(mjai_bus.subscribe(), Some(post_tracker_bus.clone()));
+// tracker: Arc<Mutex<GameTracker>>; held by AppState for IPC snapshot queries.
 ```
 
-The handle is held by `AppState` so future IPC commands can pull
-snapshots without keeping a separate reference.
+The IPC forwarder consumes the post-tracker bus and emits `game-update` with
+snapshot, rendered view, and revision from a single tracker lock.
 
 ## Querying
 
@@ -59,7 +58,9 @@ let snap = tracker.lock().await.snapshot().expect("game in progress");
 println!("oya: {}, dora: {:?}", snap.oya, snap.dora_markers);
 ```
 
-`snapshot()` returns `None` until the first `start_game` event arrives.
+`snapshot()` returns `None` before `start_game` and while the tracker is
+invalidated by lost or rejected events. A fresh `StartGame` restores the
+perspective; `StartKyoku` alone cannot recover a lost seat/game.
 
 ## The post-tracker bus, and `can_act`
 
@@ -70,6 +71,8 @@ engine then had to say about our seat:
 ```rust
 pub struct TrackedEvent {
     pub event: MjaiEvent,
+    /// False after event loss/error until a fresh StartGame.
+    pub state_valid: bool,
     /// Is the engine offering our seat a choice in the state this event
     /// produced? `None` when it has no opinion (no game, no seat).
     pub can_act: Option<bool>,
@@ -78,7 +81,9 @@ pub struct TrackedEvent {
 
 Subscribers to that bus (the analysis runner, the bot manager) can rely on
 the mirror being current when it fires, which the raw `MjaiBus` cannot
-promise.
+promise. Invalid state clears the analysis cache and drops the bot runner;
+a lagging bot consumer also drops its own incomplete history. The tracker
+emits an invalid sentinel on raw-bus overflow so consumers clear immediately.
 
 `can_act` rides *with* the event rather than being looked up on arrival, and
 that is the whole reason the type exists. One server frame can carry several
@@ -121,10 +126,10 @@ The hand string is `riichienv`'s MPSZ notation, not mjai. Use
 - A patch in `convert.rs` if a new mjai event variant has a shape
   mismatch between Akagi and riichienv.
 
-## Future: GameStateBus
+## Frontend state updates
 
-When the IPC layer needs live state push (toast-style or reactive UI),
-add a `GameStateBus` to `crate::event_bus` and have `tracker::run`
-publish a snapshot on every event (or every N events). The current
-design intentionally stops one step short of that — snapshot-on-pull
-is enough for the read-only commands we need first.
+`GameTracker::game_update()` returns the game snapshot and `MahgenView` at the
+same revision (`events_seen`, monotonically increasing across games and
+invalidation). IPC uses it for both `get_game_update` and the `game-update`
+event. The frontend applies both fields together, rejects older revisions,
+and displays analysis only at the matching game revision.

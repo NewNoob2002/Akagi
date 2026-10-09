@@ -166,6 +166,7 @@ impl BotManager {
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("bot manager lagged behind the post-tracker bus by {n} events");
+                    self.invalidate_state();
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("post-tracker bus closed; bot manager exiting");
@@ -183,13 +184,41 @@ impl BotManager {
         self.handle_tracked(TrackedEvent {
             event,
             can_act: None,
+            state_valid: true,
         })
         .await
     }
 
+    fn invalidate_state(&mut self) {
+        self.runner = None;
+        self.pending.clear();
+        self.actor_id = None;
+        self.drop_next_own_reach = false;
+        let message = "Game events were lost; bot paused until a fresh game/reconnect.";
+        self.emit_status(BotStatus::Error {
+            bot: self.active_name.clone(),
+            error: message.into(),
+        });
+        self.emit_notify(
+            Notification::error("Bot state out of sync")
+                .body(message)
+                .id("bot-state-sync"),
+        );
+    }
+
     /// Drive one tracked event through the manager.
     pub async fn handle_tracked(&mut self, tracked: TrackedEvent) -> Result<()> {
-        let TrackedEvent { event, can_act } = tracked;
+        let TrackedEvent {
+            event,
+            can_act,
+            state_valid,
+        } = tracked;
+        if !state_valid {
+            if self.runner.is_some() || self.actor_id.is_some() {
+                self.invalidate_state();
+            }
+            return Ok(());
+        }
         // Kyoku/game boundaries clear the one-shot reach-echo drop: a lost
         // declaration never produces the echo it was waiting for, so the flag
         // must not survive into the next hand and eat a real reach there.
@@ -914,7 +943,43 @@ mod tests {
     }
 
     fn tracked(event: MjaiEvent, can_act: Option<bool>) -> TrackedEvent {
-        TrackedEvent { event, can_act }
+        TrackedEvent {
+            event,
+            can_act,
+            state_valid: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tracker_state_drops_runner_and_pending_events() {
+        let (mut mgr, calls, _, _, _) = manager_with_mock(vec![]);
+        mgr.pending.push(dahai(0));
+        mgr.drop_next_own_reach = true;
+        mgr.handle_tracked(TrackedEvent {
+            event: MjaiEvent::None,
+            can_act: Some(false),
+            state_valid: false,
+        })
+        .await
+        .unwrap();
+        assert!(mgr.runner.is_none());
+        assert!(mgr.pending.is_empty());
+        assert!(mgr.actor_id.is_none());
+        assert!(!mgr.drop_next_own_reach);
+        mgr.handle(dahai(0)).await.unwrap();
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lagged_bot_does_not_react_using_partial_history() {
+        let (mgr, calls, _, _, _) = manager_with_mock(vec![]);
+        let (tx, rx) = broadcast::channel(2);
+        for _ in 0..4 {
+            tx.send(tracked(dahai(0), Some(true))).unwrap();
+        }
+        drop(tx);
+        mgr.run(rx).await.unwrap();
+        assert!(calls.lock().await.is_empty());
     }
 
     /// Regression (Hora answered with a pass press): an opponent's discard we

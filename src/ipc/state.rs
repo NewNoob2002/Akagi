@@ -8,9 +8,9 @@
 //! Snapshots vs streams: the `*_bus` channels are the canonical event
 //! stream, but a frontend that opens a window mid-game needs a one-shot
 //! "what's the current state?" answer. To serve that, the IPC forwarder
-//! task mirrors every status event into the `bot_status` /
-//! `capture_control.status` slots, and the `get_status` command reads
-//! them back. Commands that *change* state (set_active_bot,
+//! task mirrors bot status events into `bot_status`; the capture supervisor
+//! owns `capture_control.status`. The `get_status` command reads these slots
+//! back. Commands that *change* state (set_active_bot,
 //! start/stop_capture) also write the snapshot synchronously so a
 //! follow-up `get_status` is always consistent with the action that just
 //! succeeded.
@@ -32,13 +32,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 
 /// Per-running-capture-backend control handle.
 ///
-/// `stop` is `Some` while the backend task is alive; sending `()`
-/// triggers graceful shutdown and the task exits. After exit the
-/// supervisor sets `stop = None` and updates `status`.
+/// `stop` retains cancellation until the backend exits. `done` becomes true
+/// only after the backend and its status cleanup complete; timed-out or
+/// cancelled IPC calls must not make a still-stopping backend look absent.
 ///
 /// `force_close` is shared with the hudsucker handler when MITM is the
 /// active backend; calling `notify_waiters()` kicks every in-flight
@@ -47,7 +47,8 @@ use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 /// otherwise drain naturally). The Chromium backend ignores it.
 pub struct CaptureControl {
     pub status: CaptureStatus,
-    pub stop: Option<oneshot::Sender<()>>,
+    pub stop: Option<watch::Sender<bool>>,
+    pub done: Option<watch::Receiver<bool>>,
     pub force_close: Arc<Notify>,
 }
 
@@ -56,8 +57,17 @@ impl Default for CaptureControl {
         Self {
             status: CaptureStatus::Stopped,
             stop: None,
+            done: None,
             force_close: Arc::new(Notify::new()),
         }
+    }
+}
+
+impl CaptureControl {
+    pub fn is_running(&self) -> bool {
+        self.done
+            .as_ref()
+            .is_some_and(|done| !*done.borrow() && done.has_changed().is_ok())
     }
 }
 
@@ -81,6 +91,8 @@ pub struct AppState {
     /// Latest BotStatus seen on the bus. Forwarder writes; commands read.
     pub bot_status: Arc<RwLock<BotStatus>>,
     pub capture_control: Arc<Mutex<CaptureControl>>,
+    /// Serialises start, stop and restart across all command callers.
+    pub capture_operation: Arc<Mutex<()>>,
     /// Live game-state mirror. Future IPC commands lock this and call
     /// `snapshot()` to expose hands/scores/dora to the frontend.
     pub game_tracker: Arc<Mutex<GameTracker>>,
@@ -167,6 +179,7 @@ impl AppState {
             history_bus,
             bot_status: Arc::new(RwLock::new(BotStatus::Idle)),
             capture_control: Arc::new(Mutex::new(CaptureControl::default())),
+            capture_operation: Arc::new(Mutex::new(())),
             game_tracker,
             analysis_cache,
             history_store,

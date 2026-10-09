@@ -74,9 +74,16 @@ pub fn analyze(info: &PlayerInfo34) -> AnalysisResult {
         .and_then(|h| h.maintain.first())
         .map(|c| c.discard.clone());
     let best_defence_idx = risk::best_defence(&info.hand, &mixed);
-    let best_defence = best_defence_idx.map(|i| Tile34(i).to_mjai().to_string());
+    let best_defence = best_defence_idx.map(|i| {
+        let mut discard = Tile34(i).to_mjai().to_string();
+        if matches!(i, 4 | 13 | 22) && info.hand[i as usize] == info.aka_hand[i as usize / 9] {
+            discard.push('r');
+        }
+        discard
+    });
 
     AnalysisResult {
+        revision: 0,
         seat: info.seat,
         turn: info.turn,
         shanten: s,
@@ -87,5 +94,22 @@ pub fn analyze(info: &PlayerInfo34) -> AnalysisResult {
         mixed_risk: mixed.to_vec(),
         best_attack_discard: best_attack,
         best_defence_discard: best_defence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defence_discards_a_real_copy_and_keeps_red_when_possible() {
+        let mut info = hand::PlayerInfo34Builder::new()
+            .add_many(&[
+                "5pr", "E", "E", "E", "S", "S", "S", "W", "W", "W", "N", "N", "N",
+            ])
+            .build();
+        assert_eq!(analyze(&info).best_defence_discard.as_deref(), Some("5pr"));
+        info.hand[13] += 1;
+        assert_eq!(analyze(&info).best_defence_discard.as_deref(), Some("5p"));
     }
 }

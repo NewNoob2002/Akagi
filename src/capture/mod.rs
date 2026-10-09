@@ -21,10 +21,8 @@ use crate::event_bus::{MjaiBus, NotifyBus};
 use crate::logger::Session;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Discriminant exposed in [`CaptureStatus`] / IPC payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,24 +52,25 @@ pub struct CaptureDescriptor {
     pub label: String,
 }
 
-/// Long-lived shutdown signal. The supervisor holds the `Notify` and
-/// fires it when the user (or a config swap) wants the backend gone.
-/// Backends should treat the future returned by [`ShutdownToken::wait`]
-/// as a cooperative cancellation point.
+/// Retained shutdown signal. Cancellation reaches both current and future
+/// waiters, including a backend that is still starting.
 #[derive(Clone)]
-pub struct ShutdownToken(Arc<Notify>);
+pub struct ShutdownToken(watch::Receiver<bool>);
 
 impl ShutdownToken {
-    pub fn new() -> (Self, Arc<Notify>) {
-        let n = Arc::new(Notify::new());
-        (Self(n.clone()), n)
+    pub fn new() -> (Self, watch::Sender<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self(rx), tx)
     }
 
-    /// Resolves once shutdown has been requested.
-    pub fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            self.0.notified().await;
-        })
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves on cancellation or when the supervisor drops its sender.
+    pub async fn wait(&self) {
+        let mut rx = self.0.clone();
+        let _ = rx.wait_for(|cancelled| *cancelled).await;
     }
 }
 
@@ -105,4 +104,40 @@ pub trait CaptureBackend: Send {
     /// Static description for status reporting. Called once at spawn time
     /// (and again after restart) — must not block.
     fn descriptor(&self) -> CaptureDescriptor;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_reaches_late_and_multiple_waiters() {
+        let (token, cancel) = ShutdownToken::new();
+        cancel.send_replace(true);
+        assert!(token.is_cancelled());
+        let clone = token.clone();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(token.wait(), token.wait(), clone.wait());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_existing_waiters_and_sender_drop() {
+        let (token, cancel) = ShutdownToken::new();
+        let waiter = tokio::spawn(async move { token.wait().await });
+        tokio::task::yield_now().await;
+        cancel.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        let (token, cancel) = ShutdownToken::new();
+        drop(cancel);
+        tokio::time::timeout(Duration::from_millis(100), token.wait())
+            .await
+            .unwrap();
+    }
 }

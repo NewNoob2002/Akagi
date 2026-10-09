@@ -1311,8 +1311,8 @@ function CaptureStatusBar() {
     setBusy(true)
     try {
       await invoke('restart_capture')
-    } catch {
-      /* surfaced via notify */
+    } catch (error) {
+      toast.error(t('settings.restart_capture'), { description: String(error) })
     } finally {
       setBusy(false)
     }

@@ -49,8 +49,13 @@ pub fn for_opponent(active: &PlayerInfo34, op: &OpponentInfo) -> OpponentRiskVec
     let mut risk = base::risk_tiles(turns, &safe, &left, &dora, active.bakaze, op.jikaze);
 
     // Tenpai rate.
-    let tedashi: usize = op.tedashi.iter().filter(|&&b| b).count();
-    let mr_at: Vec<usize> = op.melds.iter().map(|_| 0).collect();
+    let tedashi = op
+        .tedashi
+        .iter()
+        .skip(op.last_open_meld_discard_count)
+        .filter(|&&b| b)
+        .count();
+    let mr_at = [op.last_open_meld_discard_count];
     let tenpai_rate = if op.is_riichi {
         100.0
     } else {
@@ -69,10 +74,12 @@ pub fn for_opponent(active: &PlayerInfo34, op: &OpponentInfo) -> OpponentRiskVec
         .melds
         .iter()
         .map(|m| {
-            // Dora-tile counts inside the meld — chi/pon/kan share their primary
-            // tiles; we look up the meld's anchoring tile's dora membership.
-            let anchor_idx = m.tiles.first().map(|t| t.idx()).unwrap_or(0);
-            dora.iter().filter(|d| d.idx() == anchor_idx).count() as u32
+            let mut counts = [0u8; TILE_COUNT];
+            m.add_to_counts(&mut counts);
+            dora.iter()
+                .map(|d| counts[d.idx() as usize] as u32)
+                .sum::<u32>()
+                + m.aka_count as u32
         })
         .sum();
     let point = if op.is_riichi {
@@ -154,6 +161,7 @@ mod tests {
             discards: vec![],
             tedashi: vec![],
             melds: vec![],
+            last_open_meld_discard_count: 0,
             is_riichi: false,
             riichi_turn: None,
             can_ippatsu: false,
@@ -175,6 +183,7 @@ mod tests {
             discards: vec![Tile34::from_mjai("E").unwrap(); 9],
             tedashi: vec![true; 9],
             melds: vec![],
+            last_open_meld_discard_count: 0,
             is_riichi: true,
             riichi_turn: Some(8),
             can_ippatsu: false,
@@ -188,6 +197,63 @@ mod tests {
         let m = mixed_risk(&[r]);
         // Some non-zero risk should appear on a non-genbutsu suit tile.
         assert!(m[4] > 0.0); // 5m
+    }
+
+    #[test]
+    fn tenpai_uses_only_hand_discards_after_the_last_call() {
+        let tile = Tile34::from_mjai("E").unwrap();
+        let mut op = OpponentInfo {
+            discards: ["1m", "2m", "3m", "4m", "9m"]
+                .map(|s| Tile34::from_mjai(s).unwrap())
+                .to_vec(),
+            tedashi: vec![true; 5],
+            melds: vec![super::super::hand::Meld34 {
+                kind: super::super::hand::Meld34Kind::Pon,
+                tiles: vec![tile],
+                called_tile: Some(tile),
+                from_who: Some(2),
+                aka_count: 0,
+            }],
+            last_open_meld_discard_count: 5,
+            ..Default::default()
+        };
+        assert_eq!(for_opponent(&baseline_active(), &op).tenpai_rate, 8.56);
+        op.last_open_meld_discard_count = 0;
+        assert_eq!(for_opponent(&baseline_active(), &op).tenpai_rate, 31.25);
+    }
+
+    #[test]
+    fn meld_dora_counts_every_copy_and_ippatsu_increases_risk() {
+        use crate::analysis::hand::{Meld34, Meld34Kind};
+        let mut active = baseline_active();
+        active.dora_indicators = vec![Tile34::from_mjai("4p").unwrap()];
+        let mut op = OpponentInfo {
+            melds: vec![Meld34 {
+                kind: Meld34Kind::Pon,
+                tiles: vec![Tile34(13)],
+                called_tile: Some(Tile34(13)),
+                from_who: Some(2),
+                aka_count: 1,
+            }],
+            ..Default::default()
+        };
+        let actual = for_opponent(&active, &op).risk;
+        let dora = [Tile34(13)];
+        let mut expected = base::risk_tiles(
+            0,
+            &[false; TILE_COUNT],
+            &active.compute_left_tiles(),
+            &dora,
+            active.bakaze,
+            op.jikaze,
+        );
+        base::fix_with_point(&mut expected, open_ron_point_with_dora(4));
+        assert_eq!(actual, expected);
+        op.is_riichi = true;
+        let before = for_opponent(&active, &op).risk;
+        op.can_ippatsu = true;
+        let after = for_opponent(&active, &op).risk;
+        assert!(after.iter().zip(before).any(|(a, b)| *a > b));
     }
 
     #[test]

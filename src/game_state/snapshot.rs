@@ -119,6 +119,12 @@ pub struct PlayerSnapshot {
     pub score: i32,
     pub riichi_declared: bool,
     pub riichi_stage: bool,
+    /// True while this player's one-shot riichi bonus remains available.
+    #[serde(default)]
+    pub ippatsu: bool,
+    /// Their river length at the last open call; populated by GameTracker.
+    #[serde(default)]
+    pub last_open_meld_discard_count: usize,
     pub double_riichi: bool,
     /// Index in `river` of the riichi-committing discard, if any.
     pub riichi_declaration_index: Option<usize>,
@@ -153,6 +159,14 @@ pub struct GameStateSnapshot {
     /// The seat the active observer (our bot) plays as. Captured from the
     /// `start_game.id` field. `None` if the bridge didn't tag a perspective.
     pub our_seat: Option<u8>,
+}
+
+/// Snapshot and rendered view produced from one tracker revision.
+#[derive(Debug, Clone, Serialize)]
+pub struct GameUpdate {
+    pub revision: u64,
+    pub game: Option<GameStateSnapshot>,
+    pub view: Option<super::mahgen_view::MahgenView>,
 }
 
 fn default_num_players() -> u8 {
@@ -193,6 +207,8 @@ impl GameStateSnapshot {
                     score: p.score,
                     riichi_declared: p.riichi_declared,
                     riichi_stage: p.riichi_stage,
+                    ippatsu: p.ippatsu_cycle,
+                    last_open_meld_discard_count: 0,
                     double_riichi: p.double_riichi_declared,
                     riichi_declaration_index: p.riichi_declaration_index,
                     kita_tiles: Vec::new(),
@@ -261,6 +277,8 @@ impl GameStateSnapshot {
                     score: p.score,
                     riichi_declared: p.riichi_declared,
                     riichi_stage: p.riichi_stage,
+                    ippatsu: p.ippatsu_cycle,
+                    last_open_meld_discard_count: 0,
                     double_riichi: p.double_riichi_declared,
                     riichi_declaration_index: p.riichi_declaration_index,
                     kita_tiles: p.kita_tiles.iter().copied().map(tid_to_mjai).collect(),

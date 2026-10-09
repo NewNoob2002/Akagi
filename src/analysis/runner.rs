@@ -56,16 +56,26 @@ async fn run(
     info!("analysis runner subscribed to post-tracker bus");
     loop {
         match rx.recv().await {
-            Ok(_ev) => {
+            Ok(ev) => {
+                if !ev.state_valid {
+                    *cache.write().await = None;
+                    continue;
+                }
                 // Snapshot the game state. Tracker has already digested the
                 // event (post-tracker bus ordering) and captured our seat
                 // from any `start_game.id`.
-                let snap = {
+                let (snap, revision) = {
                     let t = tracker.lock().await;
-                    t.snapshot()
+                    (t.snapshot(), t.events_seen)
                 };
-                let Some(snap) = snap else { continue };
-                let Some(seat) = snap.our_seat else { continue };
+                let Some(snap) = snap else {
+                    *cache.write().await = None;
+                    continue;
+                };
+                let Some(seat) = snap.our_seat else {
+                    *cache.write().await = None;
+                    continue;
+                };
 
                 // Build PlayerInfo34. Some snapshot states are intermediate
                 // (e.g. a 14-tile state immediately after we drew but before
@@ -75,6 +85,7 @@ async fn run(
                     Ok(i) => i,
                     Err(e) => {
                         debug!("analysis: snapshot adapter rejected event: {e:#}");
+                        *cache.write().await = None;
                         continue;
                     }
                 };
@@ -92,10 +103,17 @@ async fn run(
                     && size != 5
                 {
                     debug!("analysis: skipping hand_size={size}");
+                    *cache.write().await = None;
                     continue;
                 }
 
-                let result = super::analyze(&info);
+                let mut result = super::analyze(&info);
+                result.revision = revision;
+                // Do not publish work from before a newer tracker update.
+                let t = tracker.lock().await;
+                if t.events_seen != revision || !t.is_synchronised() {
+                    continue;
+                }
                 {
                     let mut c = cache.write().await;
                     *c = Some(result.clone());
@@ -106,6 +124,7 @@ async fn run(
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("analysis runner lagged by {n} events");
+                *cache.write().await = None;
             }
             Err(broadcast::error::RecvError::Closed) => {
                 info!("post-tracker bus closed; analysis runner exiting");
@@ -168,6 +187,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_tracker_event_clears_analysis_cache() {
+        let tracker = Arc::new(Mutex::new(GameTracker::new()));
+        tracker.lock().await.handle(&start_game()).unwrap();
+        tracker.lock().await.handle(&start_kyoku()).unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        let cache: AnalysisCache = Arc::new(RwLock::new(Some(super::super::analyze(
+            &to_player_info(&tracker.lock().await.snapshot().unwrap(), 0).unwrap(),
+        ))));
+        tracker.lock().await.invalidate();
+        tx.send(TrackedEvent {
+            event: MjaiEvent::None,
+            can_act: Some(false),
+            state_valid: false,
+        })
+        .unwrap();
+        drop(tx);
+        run(&mut rx, tracker, analysis_bus(), cache.clone()).await;
+        assert!(cache.read().await.is_none());
+    }
+
+    #[tokio::test]
     async fn runner_emits_analysis_after_start_kyoku() {
         let mjai = mjai_bus();
         let post = post_tracker_bus();
@@ -192,6 +232,7 @@ mod tests {
             .expect("recv");
 
         assert_eq!(result.seat, 0);
+        assert_eq!(result.revision, 2);
         // 13-tile drawing state at start_kyoku.
         assert_eq!(result.shanten, 0);
         // Cache should be populated.

@@ -458,6 +458,8 @@ mod tests {
             score: 25_000,
             riichi_declared: false,
             riichi_stage: false,
+            ippatsu: false,
+            last_open_meld_discard_count: 0,
             double_riichi: false,
             riichi_declaration_index: None,
             kita_tiles: vec![],

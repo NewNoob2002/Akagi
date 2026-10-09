@@ -538,13 +538,6 @@ pub async fn sync_bot_deps(name: String, force: bool, state: State<'_, AppState>
 /// instead if you want to swap.
 #[tauri::command]
 pub async fn start_capture(state: State<'_, AppState>) -> CmdResult<()> {
-    let already_running = {
-        let ctl = state.capture_control.lock().await;
-        ctl.stop.is_some()
-    };
-    if already_running {
-        return Err("capture backend already running".into());
-    }
     spawn_capture_supervisor((*state).clone())
         .await
         .map_err(|e| format!("start capture: {e:#}"))
@@ -624,26 +617,9 @@ pub async fn remove_chrome_for_testing(
 /// nothing is running.
 #[tauri::command]
 pub async fn stop_capture(state: State<'_, AppState>) -> CmdResult<()> {
-    let (stop, force_close) = {
-        let mut ctl = state.capture_control.lock().await;
-        (ctl.stop.take(), ctl.force_close.clone())
-    };
-    // Kick in-flight WS flows first so the game client actually
-    // disconnects. Without this, hudsucker's graceful shutdown only
-    // blocks new connections; existing ones drain naturally and the
-    // user sees comm "still working" even after stop. (Chromium backend
-    // ignores this — its shutdown closes the browser process directly.)
-    force_close.notify_waiters();
-    match stop {
-        Some(tx) => {
-            // Receiver dropped means the task already exited — that's fine,
-            // we still cleared `stop` and the status forwarder will catch
-            // up via the next CaptureStatus emission.
-            let _ = tx.send(());
-            Ok(())
-        }
-        None => Err("capture backend is not running".into()),
-    }
+    crate::ipc::capture_supervisor::stop_capture((*state).clone())
+        .await
+        .map_err(|e| format!("stop capture: {e:#}"))
 }
 
 #[tauri::command]
@@ -1173,7 +1149,23 @@ pub async fn subscribe_log_events(
 /// at least one result for the current game.
 #[tauri::command]
 pub async fn get_analysis(state: State<'_, AppState>) -> CmdResult<Option<AnalysisResult>> {
-    Ok(state.analysis_cache.read().await.clone())
+    let tracker = state.game_tracker.lock().await;
+    if tracker.snapshot().is_none() {
+        return Ok(None);
+    }
+    let analysis = state.analysis_cache.read().await;
+    Ok(analysis
+        .as_ref()
+        .filter(|result| result.revision == tracker.events_seen)
+        .cloned())
+}
+
+/// Return snapshot and rendered view from the same tracker revision.
+#[tauri::command]
+pub async fn get_game_update(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::game_state::snapshot::GameUpdate> {
+    Ok(state.game_tracker.lock().await.game_update())
 }
 
 /// Live game-state snapshot from the tracker. `None` before any
@@ -1770,6 +1762,7 @@ macro_rules! ipc_handlers {
             $crate::ipc::commands::read_inspector,
             $crate::ipc::commands::subscribe_inspector,
             $crate::ipc::commands::get_analysis,
+            $crate::ipc::commands::get_game_update,
             $crate::ipc::commands::get_game_snapshot,
             $crate::ipc::commands::get_mahgen_view,
             $crate::ipc::commands::compute_bot_hora_score,
